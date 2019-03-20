@@ -461,6 +461,9 @@ type RequestCtx struct {
 	// Copying Response by value is forbidden. Use pointer to Response instead.
 	Response Response
 
+	// Teardown function is fired after response was written to the buffer.
+	WriteResponseTeardownFn func()
+
 	userValues userData
 
 	lastReadDuration time.Duration
@@ -2058,6 +2061,10 @@ func (s *Server) serveConn(c net.Conn) error {
 	// release to fix #548
 	if !reqReset {
 		ctx.Request.Reset()
+	}
+	if ctx.WriteResponseTeardownFn != nil {
+		ctx.WriteResponseTeardownFn()
+		ctx.WriteResponseTeardownFn = nil
 	}
 	s.releaseCtx(ctx)
 	return err
