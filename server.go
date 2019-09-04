@@ -167,6 +167,11 @@ type Server struct {
 	//   * ErrBrokenChunks
 	ErrorHandler func(ctx *RequestCtx, err error)
 
+	// HeaderReceived is called after receiving the header
+	//
+	// non zero RequestConfig field values will overwrite the default configs
+	HeaderReceived func(header *RequestHeader) RequestConfig
+
 	// Server name for sending in response headers.
 	//
 	// Default server name is used if left blank.
@@ -199,18 +204,25 @@ type Server struct {
 	// Default buffer size is used if not set.
 	WriteBufferSize int
 
-	// Maximum duration for reading the full request (including body).
-	//
-	// This also limits the maximum duration for idle keep-alive
-	// connections.
+	// ReadTimeout is the amount of time allowed to read
+	// the full request including body. The connection's read
+	// deadline is reset when the connection opens, or for
+	// keep-alive connections after the first byte has been read.
 	//
 	// By default request read timeout is unlimited.
 	ReadTimeout time.Duration
 
-	// Maximum duration for writing the full response (including body).
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response. It is reset after the request handler
+	// has returned.
 	//
 	// By default response write timeout is unlimited.
 	WriteTimeout time.Duration
+
+	// IdleTimeout is the maximum amount of time to wait for the
+	// next request when keep-alive is enabled. If IdleTimeout
+	// is zero, the value of ReadTimeout is used.
+	IdleTimeout time.Duration
 
 	// Maximum number of concurrent client connections allowed per IP.
 	//
@@ -226,15 +238,8 @@ type Server struct {
 	// By default unlimited number of requests may be served per connection.
 	MaxRequestsPerConn int
 
-	// Maximum keep-alive connection lifetime.
-	//
-	// The server closes keep-alive connection after its' lifetime
-	// expiration.
-	//
-	// See also ReadTimeout for limiting the duration of idle keep-alive
-	// connections.
-	//
-	// By default keep-alive connection lifetime is unlimited.
+	// MaxKeepaliveDuration is a no-op and only left here for backwards compatibility.
+	// Deprecated: Use IdleTimeout instead.
 	MaxKeepaliveDuration time.Duration
 
 	// Whether to enable tcp keep-alive connections.
@@ -353,7 +358,6 @@ type Server struct {
 	readerPool     sync.Pool
 	writerPool     sync.Pool
 	hijackConnPool sync.Pool
-	bytePool       sync.Pool
 
 	// We need to know our listener so we can close it in Shutdown().
 	ln net.Listener
@@ -372,6 +376,17 @@ type Server struct {
 // msg to the client if there are more than Server.Concurrency concurrent
 // handlers h are running at the moment.
 func TimeoutHandler(h RequestHandler, timeout time.Duration, msg string) RequestHandler {
+	return TimeoutWithCodeHandler(h, timeout, msg, StatusRequestTimeout)
+}
+
+// TimeoutWithCodeHandler creates RequestHandler, which returns an error with
+// the given msg and status code to the client  if h didn't return during
+// the given duration.
+//
+// The returned handler may return StatusTooManyRequests error with the given
+// msg to the client if there are more than Server.Concurrency concurrent
+// handlers h are running at the moment.
+func TimeoutWithCodeHandler(h RequestHandler, timeout time.Duration, msg string, statusCode int) RequestHandler {
 	if timeout <= 0 {
 		return h
 	}
@@ -399,10 +414,25 @@ func TimeoutHandler(h RequestHandler, timeout time.Duration, msg string) Request
 		select {
 		case <-ch:
 		case <-ctx.timeoutTimer.C:
-			ctx.TimeoutError(msg)
+			ctx.TimeoutErrorWithCode(msg, statusCode)
 		}
 		stopTimer(ctx.timeoutTimer)
 	}
+}
+
+//RequestConfig configure the per request deadline and body limits
+type RequestConfig struct {
+	// ReadTimeout is the maximum duration for reading the entire
+	// request body.
+	// a zero value means that default values will be honored
+	ReadTimeout time.Duration
+	// WriteTimeout is the maximum duration before timing out
+	// writes of the response.
+	// a zero value means that default values will be honored
+	WriteTimeout time.Duration
+	// Maximum request body size.
+	// a zero value means that default values will be honored
+	MaxRequestBodySize int
 }
 
 // CompressHandler returns RequestHandler that transparently compresses
@@ -465,8 +495,6 @@ type RequestCtx struct {
 	WriteResponseTeardownFn func()
 
 	userValues userData
-
-	lastReadDuration time.Duration
 
 	connID         uint64
 	connRequestNum uint64
@@ -660,10 +688,9 @@ type ctxLogger struct {
 }
 
 func (cl *ctxLogger) Printf(format string, args ...interface{}) {
-	ctxLoggerLock.Lock()
 	msg := fmt.Sprintf(format, args...)
-	ctx := cl.ctx
-	cl.logger.Printf("%.3f %s - %s", time.Since(ctx.Time()).Seconds(), ctx.String(), msg)
+	ctxLoggerLock.Lock()
+	cl.logger.Printf("%.3f %s - %s", time.Since(cl.ctx.ConnTime()).Seconds(), cl.ctx.String(), msg)
 	ctxLoggerLock.Unlock()
 }
 
@@ -1015,6 +1042,8 @@ func addrToIP(addr net.Addr) net.IP {
 
 // Error sets response status code to the given value and sets response body
 // to the given message.
+//
+// Warning: this will reset the response headers and body already set!
 func (ctx *RequestCtx) Error(msg string, statusCode int) {
 	ctx.Response.Reset()
 	ctx.SetStatusCode(statusCode)
@@ -1714,10 +1743,6 @@ var (
 	// ErrConcurrencyLimit may be returned from ServeConn if the number
 	// of concurrently served connections exceeds Server.Concurrency.
 	ErrConcurrencyLimit = errors.New("cannot serve the connection because Server.Concurrency concurrent connections are served")
-
-	// ErrKeepaliveTimeout is returned from ServeConn
-	// if the connection lifetime exceeds MaxKeepaliveDuration.
-	ErrKeepaliveTimeout = errors.New("exceeded MaxKeepaliveDuration")
 )
 
 // ServeConn serves HTTP requests from the given connection.
@@ -1802,6 +1827,13 @@ func nextConnID() uint64 {
 // See Server.MaxRequestBodySize for details.
 const DefaultMaxRequestBodySize = 4 * 1024 * 1024
 
+func (s *Server) idleTimeout() time.Duration {
+	if s.IdleTimeout != 0 {
+		return s.IdleTimeout
+	}
+	return s.ReadTimeout
+}
+
 func (s *Server) serveConn(c net.Conn) error {
 	defer atomic.AddInt32(&s.open, -1)
 
@@ -1820,12 +1852,12 @@ func (s *Server) serveConn(c net.Conn) error {
 	}
 	connRequestNum := uint64(0)
 	connID := nextConnID()
-	currentTime := time.Now()
-	connTime := currentTime
+	connTime := time.Now()
 	maxRequestBodySize := s.MaxRequestBodySize
 	if maxRequestBodySize <= 0 {
 		maxRequestBodySize = DefaultMaxRequestBodySize
 	}
+	writeTimeout := s.WriteTimeout
 
 	ctx := s.acquireCtx(c)
 	ctx.connTime = connTime
@@ -1838,9 +1870,6 @@ func (s *Server) serveConn(c net.Conn) error {
 		timeoutResponse *Response
 		hijackHandler   HijackHandler
 
-		lastReadDeadlineTime  time.Time
-		lastWriteDeadlineTime time.Time
-
 		connectionClose bool
 		isHTTP11        bool
 
@@ -1848,57 +1877,101 @@ func (s *Server) serveConn(c net.Conn) error {
 	)
 	for {
 		connRequestNum++
-		ctx.time = currentTime
 
-		if s.ReadTimeout > 0 || s.MaxKeepaliveDuration > 0 {
-			lastReadDeadlineTime = s.updateReadDeadline(c, ctx, lastReadDeadlineTime)
-			if lastReadDeadlineTime.IsZero() {
-				err = ErrKeepaliveTimeout
-				break
+		// If this is a keep-alive connection set the idle timeout.
+		if connRequestNum > 1 {
+			if d := s.idleTimeout(); d > 0 {
+				if err := c.SetReadDeadline(time.Now().Add(d)); err != nil {
+					panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", d, err))
+				}
 			}
 		}
 
-		if !(s.ReduceMemoryUsage || ctx.lastReadDuration > time.Second) || br != nil {
+		if !s.ReduceMemoryUsage || br != nil {
 			if br == nil {
 				br = acquireReader(ctx)
 			}
+
+			// If this is a keep-alive connection we want to try and read the first bytes
+			// within the idle time.
+			if connRequestNum > 1 {
+				var b []byte
+				b, err = br.Peek(4)
+				if len(b) == 0 {
+					// If reading from a keep-alive connection returns nothing it means
+					// the connection was closed (either timeout or from the other side).
+					if err != io.EOF {
+						err = errNothingRead{err}
+					}
+				}
+			}
 		} else {
+			// If this is a keep-alive connection acquireByteReader will try to peek
+			// a couple of bytes already so the idle timeout will already be used.
 			br, err = acquireByteReader(&ctx)
 		}
+
 		ctx.Request.isTLS = isTLS
 		ctx.Response.Header.noDefaultContentType = s.NoDefaultContentType
 
 		if err == nil {
+			if s.ReadTimeout > 0 {
+				if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
+					panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", s.ReadTimeout, err))
+				}
+			}
 			if s.DisableHeaderNamesNormalizing {
 				ctx.Request.Header.DisableNormalizing()
 				ctx.Response.Header.DisableNormalizing()
 			}
-			// reading Headers and Body
-			err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly)
+			// reading Headers
+			if err = ctx.Request.Header.Read(br); err == nil {
+				if onHdrRecv := s.HeaderReceived; onHdrRecv != nil {
+					reqConf := onHdrRecv(&ctx.Request.Header)
+					if reqConf.ReadTimeout > 0 {
+						deadline := time.Now().Add(reqConf.ReadTimeout)
+						if err := c.SetReadDeadline(deadline); err != nil {
+							panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", deadline, err))
+						}
+					}
+					if reqConf.MaxRequestBodySize > 0 {
+						maxRequestBodySize = reqConf.MaxRequestBodySize
+					}
+					if reqConf.WriteTimeout > 0 {
+						writeTimeout = reqConf.WriteTimeout
+					}
+				}
+				//read body
+				err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly)
+			}
 			if err == nil {
 				// If we read any bytes off the wire, we're active.
 				s.setState(c, StateActive)
 			}
+
 			if (s.ReduceMemoryUsage && br.Buffered() == 0) || err != nil {
 				releaseReader(s, br)
 				br = nil
 			}
 		}
 
-		currentTime = time.Now()
-		ctx.lastReadDuration = currentTime.Sub(ctx.time)
-
 		if err != nil {
 			if err == io.EOF {
 				err = nil
-			} else if connRequestNum > 1 && err == errNothingRead {
-				// This is not the first request and we haven't read a single byte
-				// of a new request yet. This means it's just a keep-alive connection
-				// closing down either because the remote closed it or because
-				// or a read timeout on our side. Either way just close the connection
-				// and don't return any error response.
-				err = nil
-			} else {
+			} else if nr, ok := err.(errNothingRead); ok {
+				if connRequestNum > 1 {
+					// This is not the first request and we haven't read a single byte
+					// of a new request yet. This means it's just a keep-alive connection
+					// closing down either because the remote closed it or because
+					// or a read timeout on our side. Either way just close the connection
+					// and don't return any error response.
+					err = nil
+				} else {
+					err = nr.error
+				}
+			}
+
+			if err != nil {
 				bw = s.writeErrorResponse(bw, ctx, serverName, err)
 			}
 			break
@@ -1944,7 +2017,7 @@ func (s *Server) serveConn(c net.Conn) error {
 		}
 		ctx.connID = connID
 		ctx.connRequestNum = connRequestNum
-		ctx.time = currentTime
+		ctx.time = time.Now()
 		s.Handler(ctx)
 
 		timeoutResponse = ctx.timeoutResponse
@@ -1972,8 +2045,10 @@ func (s *Server) serveConn(c net.Conn) error {
 			ctx.SetConnectionClose()
 		}
 
-		if s.WriteTimeout > 0 || s.MaxKeepaliveDuration > 0 {
-			lastWriteDeadlineTime = s.updateWriteDeadline(c, ctx, lastWriteDeadlineTime)
+		if writeTimeout > 0 {
+			if err := c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%s): %s", s.WriteTimeout, err))
+			}
 		}
 
 		connectionClose = connectionClose || ctx.Response.ConnectionClose()
@@ -2022,8 +2097,8 @@ func (s *Server) serveConn(c net.Conn) error {
 				hjr = br
 				br = nil
 
-				// br may point to ctx.fbr, so do not return ctx into pool.
-				ctx = s.acquireCtx(c)
+				// br may point to ctx.fbr, so do not return ctx into pool below.
+				ctx = nil
 			}
 			if bw != nil {
 				err = bw.Flush()
@@ -2041,7 +2116,6 @@ func (s *Server) serveConn(c net.Conn) error {
 			break
 		}
 
-		currentTime = time.Now()
 		s.setState(c, StateIdle)
 
 		if atomic.LoadInt32(&s.stop) == 1 {
@@ -2056,17 +2130,19 @@ func (s *Server) serveConn(c net.Conn) error {
 	if bw != nil {
 		releaseWriter(s, bw)
 	}
-	// in unexpected cases the for loop will break
-	// before request reset call. in such cases, call it before
-	// release to fix #548
-	if !reqReset {
-		ctx.Request.Reset()
+	if ctx != nil {
+		// in unexpected cases the for loop will break
+		// before request reset call. in such cases, call it before
+		// release to fix #548
+		if !reqReset {
+			ctx.Request.Reset()
+		}
+		if ctx.WriteResponseTeardownFn != nil {
+			ctx.WriteResponseTeardownFn()
+			ctx.WriteResponseTeardownFn = nil
+		}
+		s.releaseCtx(ctx)
 	}
-	if ctx.WriteResponseTeardownFn != nil {
-		ctx.WriteResponseTeardownFn()
-		ctx.WriteResponseTeardownFn = nil
-	}
-	s.releaseCtx(ctx)
 	return err
 }
 
@@ -2074,59 +2150,6 @@ func (s *Server) setState(nc net.Conn, state ConnState) {
 	if hook := s.ConnState; hook != nil {
 		hook(nc, state)
 	}
-}
-
-func (s *Server) updateReadDeadline(c net.Conn, ctx *RequestCtx, lastDeadlineTime time.Time) time.Time {
-	readTimeout := s.ReadTimeout
-	currentTime := ctx.time
-	if s.MaxKeepaliveDuration > 0 {
-		connTimeout := s.MaxKeepaliveDuration - currentTime.Sub(ctx.connTime)
-		if connTimeout <= 0 {
-			return zeroTime
-		}
-		if connTimeout < readTimeout {
-			readTimeout = connTimeout
-		}
-	}
-
-	// Optimization: update read deadline only if more than 25%
-	// of the last read deadline exceeded.
-	// See https://github.com/golang/go/issues/15133 for details.
-	if currentTime.Sub(lastDeadlineTime) > (readTimeout >> 2) {
-		if err := c.SetReadDeadline(currentTime.Add(readTimeout)); err != nil {
-			panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", readTimeout, err))
-		}
-		lastDeadlineTime = currentTime
-	}
-	return lastDeadlineTime
-}
-
-func (s *Server) updateWriteDeadline(c net.Conn, ctx *RequestCtx, lastDeadlineTime time.Time) time.Time {
-	writeTimeout := s.WriteTimeout
-	if s.MaxKeepaliveDuration > 0 {
-		connTimeout := s.MaxKeepaliveDuration - time.Since(ctx.connTime)
-		if connTimeout <= 0 {
-			// MaxKeepAliveDuration exceeded, but let's try sending response anyway
-			// in 100ms with 'Connection: close' header.
-			ctx.SetConnectionClose()
-			connTimeout = 100 * time.Millisecond
-		}
-		if connTimeout < writeTimeout {
-			writeTimeout = connTimeout
-		}
-	}
-
-	// Optimization: update write deadline only if more than 25%
-	// of the last write deadline exceeded.
-	// See https://github.com/golang/go/issues/15133 for details.
-	currentTime := time.Now()
-	if currentTime.Sub(lastDeadlineTime) > (writeTimeout >> 2) {
-		if err := c.SetWriteDeadline(currentTime.Add(writeTimeout)); err != nil {
-			panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%s): %s", writeTimeout, err))
-		}
-		lastDeadlineTime = currentTime
-	}
-	return lastDeadlineTime
 }
 
 func hijackConnHandler(r io.Reader, c net.Conn, s *Server, h HijackHandler) {
@@ -2216,7 +2239,6 @@ func acquireByteReader(ctxP **RequestCtx) (*bufio.Reader, error) {
 	ctx := *ctxP
 	s := ctx.s
 	c := ctx.c
-	t := ctx.time
 	s.releaseCtx(ctx)
 
 	// Make GC happy, so it could garbage collect ctx
@@ -2224,16 +2246,10 @@ func acquireByteReader(ctxP **RequestCtx) (*bufio.Reader, error) {
 	ctx = nil
 	*ctxP = nil
 
-	v := s.bytePool.Get()
-	if v == nil {
-		v = make([]byte, 1)
-	}
-	b := v.([]byte)
-	n, err := c.Read(b)
-	ch := b[0]
-	s.bytePool.Put(v)
+	var b [1]byte
+	n, err := c.Read(b[:])
+
 	ctx = s.acquireCtx(c)
-	ctx.time = t
 	*ctxP = ctx
 	if err != nil {
 		// Treat all errors as EOF on unsuccessful read
@@ -2245,7 +2261,7 @@ func acquireByteReader(ctxP **RequestCtx) (*bufio.Reader, error) {
 	}
 
 	ctx.fbr.c = c
-	ctx.fbr.ch = ch
+	ctx.fbr.ch = b[0]
 	ctx.fbr.byteRead = false
 	r := acquireReader(ctx)
 	r.Reset(&ctx.fbr)
@@ -2317,7 +2333,6 @@ func (ctx *RequestCtx) Init2(conn net.Conn, logger Logger, reduceMemoryUsage boo
 	ctx.s = fakeServer
 	ctx.connRequestNum = 0
 	ctx.connTime = time.Now()
-	ctx.time = ctx.connTime
 
 	keepBodyBuffer := !reduceMemoryUsage
 	ctx.Request.keepBodyBuffer = keepBodyBuffer

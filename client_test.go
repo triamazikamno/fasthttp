@@ -19,6 +19,67 @@ import (
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
+func TestClientURLAuth(t *testing.T) {
+	cases := map[string]string{
+		"user:pass@": "dXNlcjpwYXNz",
+		"foo:@":      "Zm9vOg==",
+		":@":         "",
+		"@":          "",
+		"":           "",
+	}
+
+	ch := make(chan string, 1)
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			ch <- string(ctx.Request.Header.Peek(HeaderAuthorization))
+		},
+	}
+	go s.Serve(ln)
+	c := &Client{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+	}
+	for up, expected := range cases {
+		req := AcquireRequest()
+		req.Header.SetMethod(MethodGet)
+		req.SetRequestURI("http://" + up + "example.com")
+		if err := c.Do(req, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		val := <-ch
+
+		if val != expected {
+			t.Fatalf("wrong %s header: %s expected %s", HeaderAuthorization, val, expected)
+		}
+	}
+}
+
+func TestClientNilResp(t *testing.T) {
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+		},
+	}
+	go s.Serve(ln)
+	c := &Client{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+	}
+	req := AcquireRequest()
+	req.Header.SetMethod(MethodGet)
+	req.SetRequestURI("http://example.com")
+	if err := c.Do(req, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DoTimeout(req, nil, time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientParseConn(t *testing.T) {
 	network := "tcp"
 	ln, _ := net.Listen(network, "127.0.0.1:0")
@@ -76,7 +137,7 @@ func TestClientPostArgs(t *testing.T) {
 	args := req.PostArgs()
 	args.Add("addhttp2", "support")
 	args.Add("fast", "http")
-	req.Header.SetMethod("POST")
+	req.Header.SetMethod(MethodPost)
 	req.SetRequestURI("http://make.fasthttp.great?again")
 	err := c.Do(req, res)
 	if err != nil {
@@ -467,8 +528,8 @@ func TestClientDoWithCustomHeaders(t *testing.T) {
 			ch <- fmt.Errorf("cannot read client request: %s", err)
 			return
 		}
-		if string(req.Header.Method()) != "POST" {
-			ch <- fmt.Errorf("unexpected request method: %q. Expecting %q", req.Header.Method(), "POST")
+		if string(req.Header.Method()) != MethodPost {
+			ch <- fmt.Errorf("unexpected request method: %q. Expecting %q", req.Header.Method(), MethodPost)
 			return
 		}
 		reqURI := req.RequestURI()
@@ -509,7 +570,7 @@ func TestClientDoWithCustomHeaders(t *testing.T) {
 	}()
 
 	var req Request
-	req.Header.SetMethod("POST")
+	req.Header.SetMethod(MethodPost)
 	req.SetRequestURI(uri)
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -824,7 +885,7 @@ func TestHostClientMaxConnsWithDeadline(t *testing.T) {
 
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
-			req.Header.SetMethod("POST")
+			req.Header.SetMethod(MethodPost)
 			req.SetBodyString("bar")
 			resp := AcquireResponse()
 
@@ -1710,5 +1771,45 @@ func startEchoServerExt(t *testing.T, network, addr string, isTLS bool) *testEch
 		ln: ln,
 		ch: ch,
 		t:  t,
+	}
+}
+
+func TestClientTLSHandshakeTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := listener.Addr().String()
+	defer listener.Close()
+
+	complete := make(chan bool)
+	defer close(complete)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		<-complete
+		conn.Close()
+	}()
+
+	client := Client{
+		WriteTimeout: 1 * time.Second,
+		ReadTimeout:  1 * time.Second,
+	}
+
+	_, _, err = client.Get(nil, "https://"+addr)
+	if err == nil {
+		t.Fatal("tlsClientHandshake completed successfully")
+	}
+
+	if err != ErrTLSHandshakeTimeout {
+		t.Errorf("resulting error not a timeout: %v\nType %T: %#v", err, err, err)
 	}
 }
